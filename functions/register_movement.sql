@@ -32,14 +32,13 @@ DECLARE
     error_code_checked_select VARCHAR(20) DEFAULT 'P0002'; -- código de error por selects sin registros
 
     -- variables locales
-    local_current_stock       INTEGER;
+    local_current_stock_ori   INTEGER;
     local_isSuccessProcess    BIT DEFAULT 0;
     local_user_code           TEXT;
     local_movement_type_name  TEXT;
     local_warehouse_code      TEXT;
-    local_warehouse_stock_id  INTEGER;
-    local_product_quantity    INTEGER;
-
+    local_dest_capacity       INTEGER;
+    local_current_stock_dest  INTEGER;
 
 BEGIN
     -- asignación de parámetros de entrada
@@ -74,10 +73,10 @@ BEGIN
         -- validar el id del producto
         IF in_product_id IS NULL THEN
             RAISE EXCEPTION 'El id del producto no puede ir vacío.' USING ERRCODE = error_code_checked;
-        END IF;
-
-        IF in_movement_type_id IS NULL THEN
-            RAISE EXCEPTION 'El tipo de movimiento no puede ir vacío.' USING ERRCODE = error_code_checked;
+        ELSIF NOT EXISTS(SELECT 1
+                         FROM inventory_management.products
+                         WHERE product_id = in_product_id) THEN
+            RAISE EXCEPTION 'El producto no existe.' USING ERRCODE = error_code_checked;
         END IF;
 
         IF in_product_quantity IS NULL OR in_product_quantity <= 0 THEN
@@ -94,16 +93,22 @@ BEGIN
         FROM inventory_management.movements_types
         WHERE movement_type_id = in_movement_type_id;
 
+        IF in_movement_type_id IS NULL THEN
+            RAISE EXCEPTION 'El tipo de movimiento no puede ir vacío.' USING ERRCODE = error_code_checked;
+        ElSIF local_movement_type_name IS NULL THEN
+            RAISE EXCEPTION 'El tipo de movimiento no existe.' USING ERRCODE = error_code_checked;
+        END IF;
+
         -- Validar almacenes según tipo de movimiento
         IF local_movement_type_name = 'TRASLADO' THEN
             IF in_warehouse_origin_id IS NULL OR in_warehouse_dest_id IS NULL THEN
-                RAISE EXCEPTION 'Para un traslado, se requieren los IDs de almacén de origen y destino.'
+                RAISE EXCEPTION 'Para un traslado, se requieren el almacén de origen y de destino.'
                     USING ERRCODE = error_code_checked;
             END IF;
 
         ELSIF local_movement_type_name = 'SALIDA' THEN
             IF in_warehouse_origin_id IS NULL THEN
-                RAISE EXCEPTION 'Para una salida, se requiere EL ID del almacén de origen.'
+                RAISE EXCEPTION 'Para una salida, se requiere el almacén de origen.'
                     USING ERRCODE = error_code_checked;
             ELSIF in_warehouse_dest_id IS NOT NULL THEN
                 RAISE EXCEPTION 'Una salida no debe tener almacén de destino asignado.'
@@ -112,12 +117,46 @@ BEGIN
 
         ELSIF local_movement_type_name = 'ENTRADA' THEN
             IF in_warehouse_dest_id IS NULL THEN
-                RAISE EXCEPTION 'Para una entrada, se requiere EL ID del almacén de destino.'
+                RAISE EXCEPTION 'Para una entrada, se requiere el almacén de destino.'
                     USING ERRCODE = error_code_checked;
             ELSIF in_warehouse_origin_id IS NOT NULL THEN
                 RAISE EXCEPTION 'Una entrada no debe tener almacén de origen asignado.'
                     USING ERRCODE = error_code_checked;
             END IF;
+        END IF;
+
+        -- validar la existencia de las ubicaciones
+        IF in_warehouse_origin_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1
+                            FROM inventory_management.warehouses
+                            WHERE warehouse_id = in_warehouse_origin_id) THEN
+            RAISE EXCEPTION 'El almacén de origen no existe.' USING ERRCODE = error_code_checked;
+        END IF;
+
+        IF in_warehouse_dest_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1
+                            FROM inventory_management.warehouses
+                            WHERE warehouse_id = in_warehouse_dest_id) THEN
+            RAISE EXCEPTION 'El almacén de destino no existe.' USING ERRCODE = error_code_checked;
+        END IF;
+
+        -- Consultar capacidad del almacén destino
+        SELECT capacity
+        INTO local_dest_capacity
+        FROM inventory_management.warehouses
+        WHERE warehouse_id = in_warehouse_dest_id;
+
+        -- Sumar el stock actual del almacén destino
+        SELECT COALESCE(SUM(product_quantity), 0)
+        INTO local_current_stock_dest
+        FROM inventory_management.warehouses_stocks
+        WHERE warehouse_id = in_warehouse_dest_id;
+
+        -- Validar que la capacidad no se exceda
+        IF local_current_stock_dest + in_product_quantity > local_dest_capacity THEN
+            RAISE EXCEPTION 'La operación supera la capacidad del almacén destino (máximo: %, actual: %, intento: %).',
+                local_dest_capacity, local_current_stock_dest, in_product_quantity
+                USING ERRCODE = error_code_checked;
         END IF;
 
         --** Inicio de proceso
@@ -130,42 +169,18 @@ BEGIN
 
         -- validar stock en salidas o traslados
         IF local_movement_type_name IN ('SALIDA', 'TRASLADO') THEN
+
             SELECT product_quantity
-            INTO local_current_stock
+            INTO local_current_stock_ori
             FROM inventory_management.warehouses_stocks
             WHERE product_id = in_product_id
               AND warehouse_id = in_warehouse_origin_id;
 
-            IF local_current_stock IS NULL OR local_current_stock < in_product_quantity THEN
+            IF local_current_stock_ori IS NULL OR local_current_stock_ori < in_product_quantity THEN
                 RAISE EXCEPTION 'Stock insuficiente en almacén de origen "%", disponible: %, requerido: %',
-                    local_warehouse_code, COALESCE(local_current_stock, 0), in_product_quantity
+                    local_warehouse_code, COALESCE(local_current_stock_ori, 0), in_product_quantity
                     USING ERRCODE = error_code_checked_select;
             END IF;
-
-            -- actualizar stock del almacén origen
-            UPDATE inventory_management.warehouses_stocks
-            SET product_quantity            = product_quantity - in_product_quantity,
-                warehouse_stock_update_date = CURRENT_TIMESTAMP
-            WHERE product_id = in_product_id
-              AND warehouse_id = in_warehouse_origin_id
-            RETURNING warehouse_stock_id, product_quantity INTO local_warehouse_stock_id, local_product_quantity;
-
-            IF local_product_quantity = 0 THEN
-                DELETE
-                FROM inventory_management.warehouses_stocks
-                WHERE warehouse_stock_id = local_warehouse_stock_id;
-            END IF;
-
-        END IF;
-
-        -- actualizar stock del almacén destino si aplica
-        IF local_movement_type_name IN ('ENTRADA', 'TRASLADO') THEN
-            INSERT INTO inventory_management.warehouses_stocks (warehouse_id, product_id, product_quantity)
-            VALUES (in_warehouse_dest_id, in_product_id, in_product_quantity)
-            ON CONFLICT (warehouse_id, product_id) DO UPDATE
-                SET product_quantity            = inventory_management.warehouses_stocks.product_quantity +
-                                                  EXCLUDED.product_quantity,
-                    warehouse_stock_update_date = CURRENT_TIMESTAMP;
         END IF;
 
         -- registrar movimiento

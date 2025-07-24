@@ -103,6 +103,7 @@ CREATE TABLE inventory_management.warehouses_stocks
     warehouse_id                  INTEGER,
     product_id                    INTEGER,
     product_quantity              INTEGER                             NOT NULL,
+    warehouse_stock_minimum       INTEGER                             NOT NULL,
     warehouse_stock_creation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     warehouse_stock_update_date   TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
