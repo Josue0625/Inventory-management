@@ -27,5 +27,7 @@ psql -U postgres -d inventory -f ./data/movements.sql
 REM FUNCTIONS
 psql -U postgres -d inventory -f ./sources/register_log_entry.sql
 psql -U postgres -d inventory -f ./sources/register_log_output.sql
+psql -U postgres -d inventory -f ./sources/trigger_update_stock_after_movement.sql
 psql -U postgres -d inventory -f ./functions/utils/any_element_to_string.sql
 psql -U postgres -d inventory -f ./functions/register_movement.sql
+psql -U postgres -d inventory -f ./functions/get_inventory_report.sql
